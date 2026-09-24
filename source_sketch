@@ -2,27 +2,27 @@
 #include <Adafruit_NeoPixel.h>
 #include <DHT.h>
 #include <Wire.h>
-#include <Adafruit_BMP085.h> // Library for BMP180 / BMP085 (XC3702)
+#include <Adafruit_BMP085.h> // Library for BMP180 / XC3702
 
-// --- PIN DEFINITIONS ---
-// Direct parallel 4-bit LCD wiring (RS, E, D4, D5, D6, D7)
+// --- HARDWARE PIN DEFINITIONS ---
+// Parallel 4-bit LCD wiring (RS, E, D4, D5, D6, D7)
 const int LCD_RS = 8;
 const int LCD_E  = 9;
 const int LCD_D4 = 4;
 const int LCD_D5 = 5;
 const int LCD_D6 = 6;
 const int LCD_D7 = 7;
-const int LCD_BACKLIGHT_PIN = 10; // PWM pin for dynamic backlight dimming
+const int LCD_BACKLIGHT_PIN = 10; // PWM pin for dynamic sleep dimming
 
-const int DHT_PIN = 2;            // XC4520 Temperature/Humidity
-const int LED_PIN = 3;            // XC4380 WS2812B DIN
+const int DHT_PIN = 2;            // XC4520 Humidity data pin
+const int LED_PIN = 3;            // XC4380 WS2812B DIN pin
 const int LDR_PIN = A0;           // Ambient Light Sensor (Analog In)
-// Note: BMP180 connects to hardware I2C: SDA -> A4, SCL -> A5
+// Note: BMP180 connects via hardware I2C: SDA -> A4, SCL -> A5
 
-// --- HARDWARE CONFIGURATION ---
+// --- HARDWARE INSTANCES ---
 LiquidCrystal lcd(LCD_RS, LCD_E, LCD_D4, LCD_D5, LCD_D6, LCD_D7);
 
-#define DHTTYPE DHT11 // Change to DHT22 if using high-precision XC4520
+#define DHTTYPE DHT11 // Set to DHT22 if using high-precision XC4520
 DHT dht(DHT_PIN, DHTTYPE);
 
 #define NUM_LEDS 8
@@ -31,34 +31,39 @@ Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
 Adafruit_BMP085 bmp;
 bool bmpAvailable = false;
 
-// Timing & Thresholds
+// --- TIMING & CALIBRATION THRESHOLDS ---
 unsigned long lastReadTime = 0;
-const unsigned long READ_INTERVAL = 2000;
+const unsigned long READ_INTERVAL = 2000; // Sample every 2 seconds
 
-// Room light calibration thresholds
-const int DARK_LIGHT_LEVEL = 40;   // Threshold representing a dark bedroom
-const int BRIGHT_LIGHT_LEVEL = 700; // Threshold representing ambient room lighting
+// Light sensor boundaries
+const int DARK_LIGHT_LEVEL   = 40;   // Dark bedroom threshold
+const int BRIGHT_LIGHT_LEVEL = 700;  // Full room lighting threshold
 
-// Brightness bounds for night vs. day
-const uint8_t MIN_LED_BRIGHTNESS = 1;   // Bare minimum to keep LEDs lit without bedroom glare
-const uint8_t MAX_LED_BRIGHTNESS = 120; // Full daylight brightness
+// Dimming bounds (Night vs Day)
+const uint8_t MIN_LED_BRIGHTNESS = 1;   // Faint night glow, no bedroom glare
+const uint8_t MAX_LED_BRIGHTNESS = 120; // Full daytime brightness
 
-const int MIN_LCD_BACKLIGHT = 6;   // Barely visible night glow to read characters
-const int MAX_LCD_BACKLIGHT = 255; // Full daylight backlight
+const int MIN_LCD_BACKLIGHT = 6;   // Faint night glow for character readability
+const int MAX_LCD_BACKLIGHT = 255; // Full daytime backlight
 
 void setup() {
   Serial.begin(9600);
-  pinMode(LCD_BACKLIGHT_PIN, OUTPUT);
-  analogWrite(LCD_BACKLIGHT_PIN, MAX_LCD_BACKLIGHT); // Full on during boot
 
+  // Initialize LCD Backlight on PWM
+  pinMode(LCD_BACKLIGHT_PIN, OUTPUT);
+  analogWrite(LCD_BACKLIGHT_PIN, MAX_LCD_BACKLIGHT);
+
+  // Initialize LCD (16x2)
   lcd.begin(16, 2);
   lcd.clear();
   lcd.print("System Starting");
 
+  // Initialize WS2812B Strip
   strip.begin();
   strip.clear();
   strip.show();
 
+  // Initialize Sensors
   dht.begin();
   Wire.begin();
 
@@ -67,7 +72,7 @@ void setup() {
     Serial.println("BMP180 initialized successfully.");
   } else {
     bmpAvailable = false;
-    Serial.println("BMP180 NOT detected. Check wiring: SDA->A4, SCL->A5.");
+    Serial.println("BMP180 NOT detected! Check wiring: SDA->A4, SCL->A5.");
     lcd.setCursor(0, 1);
     lcd.print("BMP Not Found!");
   }
@@ -82,37 +87,46 @@ void loop() {
   if (currentMillis - lastReadTime >= READ_INTERVAL) {
     lastReadTime = currentMillis;
 
-    float temp = dht.readTemperature();
-    float hum  = dht.readHumidity();
+    // 1. Read Sensors
+    // Temperature: derived from externally mounted BMP180 (fallback to DHT if offline)
+    float temp = 0.0;
     float pressure = 0.0;
     
     if (bmpAvailable) {
+      temp = bmp.readTemperature();
       pressure = bmp.readPressure() / 100.0F; // Convert Pa to hPa
+    } else {
+      temp = dht.readTemperature();
     }
 
+    // Relative Humidity: derived from XC4520
+    float hum = dht.readHumidity();
+
+    // Ambient Light Level
     int ldrValue = analogRead(LDR_PIN);
 
+    // Sensor fault check
     if (isnan(temp) || isnan(hum)) {
       lcd.setCursor(0, 0);
-      lcd.print("DHT Sensor Err  ");
+      lcd.print("Sensor Read Err ");
       return;
     }
 
-    // --- CONTINUOUS NIGHT-GLOW DIMMING ---
-    // Smoothly scale WS2812B brightness between 1 (night minimum) and 120 (day)
+    // 2. Dynamic Night / Ambient Dimming
+    // Continuous scale for WS2812B LEDs
     uint8_t ledBrightness = map(constrain(ldrValue, DARK_LIGHT_LEVEL, BRIGHT_LIGHT_LEVEL),
-                                DARK_LIGHT_LEVEL, BRIGHT_LIGHT_LEVEL, 
+                                DARK_LIGHT_LEVEL, BRIGHT_LIGHT_LEVEL,
                                 MIN_LED_BRIGHTNESS, MAX_LED_BRIGHTNESS);
     strip.setBrightness(ledBrightness);
     updateLedStrip(temp, hum);
 
-    // Smoothly scale LCD Backlight between 6 (subtle night glow) and 255 (day)
+    // Continuous scale for LCD Backlight PWM
     int lcdBacklight = map(constrain(ldrValue, DARK_LIGHT_LEVEL, BRIGHT_LIGHT_LEVEL),
-                           DARK_LIGHT_LEVEL, BRIGHT_LIGHT_LEVEL, 
+                           DARK_LIGHT_LEVEL, BRIGHT_LIGHT_LEVEL,
                            MIN_LCD_BACKLIGHT, MAX_LCD_BACKLIGHT);
     analogWrite(LCD_BACKLIGHT_PIN, lcdBacklight);
 
-    // Refresh LCD text
+    // 3. Update LCD Output (Rounded Integers)
     updateLcdDisplay(temp, hum, pressure);
   }
 }
@@ -120,45 +134,46 @@ void loop() {
 void updateLedStrip(float temp, float hum) {
   strip.clear();
 
-  // --- Temperature LEDs (0 to 3) ---
+  // --- Temperature LEDs (0 to 3) [from BMP180] ---
   if (temp < 24.0) {
-    strip.setPixelColor(0, strip.Color(0, 0, 255));
+    strip.setPixelColor(0, strip.Color(0, 0, 255));      // < 24 C: Blue
   } else if (temp >= 24.0 && temp <= 27.0) {
-    strip.setPixelColor(1, strip.Color(0, 255, 0));
+    strip.setPixelColor(1, strip.Color(0, 255, 0));      // 24-27 C (Darwin Baseline): Green
   } else if (temp > 27.0 && temp <= 32.0) {
-    strip.setPixelColor(2, strip.Color(255, 255, 0));
+    strip.setPixelColor(2, strip.Color(255, 255, 0));    // 28-32 C: Yellow
   } else {
-    strip.setPixelColor(3, strip.Color(255, 0, 0));
+    strip.setPixelColor(3, strip.Color(255, 0, 0));      // > 32 C: Red
   }
 
-  // --- Humidity LEDs (4 to 7) ---
+  // --- Humidity LEDs (4 to 7) [from XC4520] ---
   if (hum < 40.0) {
-    strip.setPixelColor(4, strip.Color(255, 64, 0));
+    strip.setPixelColor(4, strip.Color(255, 64, 0));     // < 40%: Orange
   } else if (hum >= 40.0 && hum <= 60.0) {
-    strip.setPixelColor(5, strip.Color(0, 255, 0));
+    strip.setPixelColor(5, strip.Color(0, 255, 0));      // 40-60% (Optimal): Green
   } else if (hum > 60.0 && hum <= 80.0) {
-    strip.setPixelColor(6, strip.Color(64, 128, 255));
+    strip.setPixelColor(6, strip.Color(64, 128, 255));   // 60-80%: Light Blue
   } else {
-    strip.setPixelColor(7, strip.Color(0, 0, 255));
+    strip.setPixelColor(7, strip.Color(0, 0, 255));      // > 80%: Blue
   }
 
   strip.show();
 }
 
 void updateLcdDisplay(float temp, float hum, float pressure) {
-  // Line 1: Temperature & Humidity
+  // Line 1: Rounded whole-number Temperature (BMP180) and Humidity (XC4520)
+  // Format: "T:28°C  H:52%   "
   lcd.setCursor(0, 0);
   lcd.print("T:");
-  lcd.print(temp, 1);
+  lcd.print((int)round(temp));
   lcd.print((char)223); // Degree symbol
-  lcd.print("C H:");
-  lcd.print((int)hum);
+  lcd.print("C  H:");
+  lcd.print((int)round(hum));
   lcd.print("%   ");
 
-  // Line 2: Barometric Pressure & Rain Warnings (< 1010 hPa)
+  // Line 2: Barometric Pressure (hPa rounded) & Weather Alerts
   lcd.setCursor(0, 1);
   if (bmpAvailable) {
-    lcd.print((int)pressure);
+    lcd.print((int)round(pressure));
     lcd.print("hPa ");
 
     if (pressure < 1000.0) {
