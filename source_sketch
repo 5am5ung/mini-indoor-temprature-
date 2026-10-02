@@ -40,11 +40,49 @@ const int DARK_LIGHT_LEVEL   = 40;   // Dark bedroom threshold
 const int BRIGHT_LIGHT_LEVEL = 700;  // Full room lighting threshold
 
 // Dimming bounds (Night vs Day)
-const uint8_t MIN_LED_BRIGHTNESS = 1;   // Faint night glow, no bedroom glare
-const uint8_t MAX_LED_BRIGHTNESS = 120; // Full daytime brightness
+const int MIN_LCD_BACKLIGHT = 4;     // Faint night glow (~1.5% PWM)
+const int MAX_LCD_BACKLIGHT = 255;   // Full daytime backlight
 
-const int MIN_LCD_BACKLIGHT = 6;   // Faint night glow for character readability
-const int MAX_LCD_BACKLIGHT = 255; // Full daytime backlight
+// Softened low-glare ceiling for NeoPixels (16 out of 255 = ~6% max power)
+const uint8_t MIN_LED_BRIGHTNESS = 1;
+const uint8_t MAX_LED_BRIGHTNESS = 16; 
+
+// Helper function: Granular multi-stage stepping calculation
+void calculateGranularBrightness(int ldrRaw, uint8_t &ledOut, int &lcdOut, float &colorScaleOut) {
+  int ldr = constrain(ldrRaw, DARK_LIGHT_LEVEL, BRIGHT_LIGHT_LEVEL);
+
+  // 5 Granular Stepping Tiers tuned for ultra-soft indicator glow:
+  if (ldr <= 60) {
+    // Stage 1: Pitch Dark / Bedtime
+    lcdOut = 4;
+    ledOut = 1;
+    colorScaleOut = 0.50f; // Scale down sub-pixel values 50% below the hardware floor
+  } 
+  else if (ldr <= 150) {
+    // Stage 2: Deep Twilight / Nightlight
+    lcdOut = 18;
+    ledOut = 2;
+    colorScaleOut = 0.85f;
+  } 
+  else if (ldr <= 320) {
+    // Stage 3: Low Indoor / Evening Lamp
+    lcdOut = 55;
+    ledOut = 5;
+    colorScaleOut = 1.0f;
+  } 
+  else if (ldr <= 520) {
+    // Stage 4: Overcast / Ambient Daytime Indoor
+    lcdOut = 140;
+    ledOut = 10;
+    colorScaleOut = 1.0f;
+  } 
+  else {
+    // Stage 5: Bright Room / Direct Daylight (Gentle, diffused ceiling of 16)
+    lcdOut = 255;
+    ledOut = MAX_LED_BRIGHTNESS;
+    colorScaleOut = 1.0f;
+  }
+}
 
 void setup() {
   Serial.begin(9600);
@@ -88,7 +126,6 @@ void loop() {
     lastReadTime = currentMillis;
 
     // 1. Read Sensors
-    // Temperature: derived from externally mounted BMP180 (fallback to DHT if offline)
     float temp = 0.0;
     float pressure = 0.0;
     
@@ -99,7 +136,7 @@ void loop() {
       temp = dht.readTemperature();
     }
 
-    // Relative Humidity: derived from XC4520
+    // Relative Humidity
     float hum = dht.readHumidity();
 
     // Ambient Light Level
@@ -112,48 +149,54 @@ void loop() {
       return;
     }
 
-    // 2. Dynamic Night / Ambient Dimming
-    // Continuous scale for WS2812B LEDs
-    uint8_t ledBrightness = map(constrain(ldrValue, DARK_LIGHT_LEVEL, BRIGHT_LIGHT_LEVEL),
-                                DARK_LIGHT_LEVEL, BRIGHT_LIGHT_LEVEL,
-                                MIN_LED_BRIGHTNESS, MAX_LED_BRIGHTNESS);
-    strip.setBrightness(ledBrightness);
-    updateLedStrip(temp, hum);
+    // 2. Granular Ambient Dimming Calculation
+    uint8_t ledBrightness = 1;
+    int lcdBacklight = 4;
+    float colorScale = 1.0f;
 
-    // Continuous scale for LCD Backlight PWM
-    int lcdBacklight = map(constrain(ldrValue, DARK_LIGHT_LEVEL, BRIGHT_LIGHT_LEVEL),
-                           DARK_LIGHT_LEVEL, BRIGHT_LIGHT_LEVEL,
-                           MIN_LCD_BACKLIGHT, MAX_LCD_BACKLIGHT);
+    calculateGranularBrightness(ldrValue, ledBrightness, lcdBacklight, colorScale);
+
+    // Apply LCD Backlight PWM
     analogWrite(LCD_BACKLIGHT_PIN, lcdBacklight);
 
-    // 3. Update LCD Output (Rounded Integers)
+    // Apply NeoPixel Brightness and Color Scaling
+    strip.setBrightness(ledBrightness);
+    updateLedStrip(temp, hum, colorScale);
+
+    // 3. Update LCD Output
     updateLcdDisplay(temp, hum, pressure);
   }
 }
 
-void updateLedStrip(float temp, float hum) {
+void updateLedStrip(float temp, float hum, float scale) {
   strip.clear();
+
+  // Helper lambda for scaling individual color channels:
+  // Caps saturated color components at 180 instead of 255 to eliminate harshness
+  auto scaleColor = [scale](uint8_t r, uint8_t g, uint8_t b) {
+    return strip.Color((uint8_t)(r * scale), (uint8_t)(g * scale), (uint8_t)(b * scale));
+  };
 
   // --- Temperature LEDs (0 to 3) [from BMP180] ---
   if (temp < 24.0) {
-    strip.setPixelColor(0, strip.Color(0, 0, 255));      // < 24 C: Blue
+    strip.setPixelColor(0, scaleColor(0, 0, 180));       // < 24 C: Soft Blue
   } else if (temp >= 24.0 && temp <= 27.0) {
-    strip.setPixelColor(1, strip.Color(0, 255, 0));      // 24-27 C (Darwin Baseline): Green
+    strip.setPixelColor(1, scaleColor(0, 180, 0));       // 24-27 C: Soft Green
   } else if (temp > 27.0 && temp <= 32.0) {
-    strip.setPixelColor(2, strip.Color(255, 255, 0));    // 28-32 C: Yellow
+    strip.setPixelColor(2, scaleColor(180, 140, 0));     // 28-32 C: Soft Warm Yellow
   } else {
-    strip.setPixelColor(3, strip.Color(255, 0, 0));      // > 32 C: Red
+    strip.setPixelColor(3, scaleColor(180, 0, 0));       // > 32 C: Soft Red
   }
 
   // --- Humidity LEDs (4 to 7) [from XC4520] ---
   if (hum < 40.0) {
-    strip.setPixelColor(4, strip.Color(255, 64, 0));     // < 40%: Orange
+    strip.setPixelColor(4, scaleColor(180, 45, 0));      // < 40%: Soft Orange
   } else if (hum >= 40.0 && hum <= 60.0) {
-    strip.setPixelColor(5, strip.Color(0, 255, 0));      // 40-60% (Optimal): Green
+    strip.setPixelColor(5, scaleColor(0, 180, 0));       // 40-60%: Soft Green
   } else if (hum > 60.0 && hum <= 80.0) {
-    strip.setPixelColor(6, strip.Color(64, 128, 255));   // 60-80%: Light Blue
+    strip.setPixelColor(6, scaleColor(40, 90, 180));     // 60-80%: Soft Cyan/Blue
   } else {
-    strip.setPixelColor(7, strip.Color(0, 0, 255));      // > 80%: Blue
+    strip.setPixelColor(7, scaleColor(0, 0, 180));       // > 80%: Soft Blue
   }
 
   strip.show();
@@ -161,7 +204,6 @@ void updateLedStrip(float temp, float hum) {
 
 void updateLcdDisplay(float temp, float hum, float pressure) {
   // Line 1: Rounded whole-number Temperature (BMP180) and Humidity (XC4520)
-  // Format: "T:28°C  H:52%   "
   lcd.setCursor(0, 0);
   lcd.print("T:");
   lcd.print((int)round(temp));
